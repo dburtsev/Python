@@ -99,6 +99,7 @@ print(x)
 
 sql = "SELECT CAST('t' AS BOOLEAN) AS clmn1, CAST(2.2 AS FLOAT4) AS clmn2, CAST(2.3 AS FLOAT) AS clmn3 UNION ALL SELECT CAST('f' AS BOOLEAN), 3.0, 4.5;"
 tbl = ExecuteReader(sql_client,ClusterIdentifier,Database,DbUser,sql)
-print(tbl)
-
+for row in tbl:
+    # print second field values
+    print(list(row[1].values())[0])
 
