@@ -9,14 +9,15 @@ from awsglue.dynamicframe import DynamicFrame
 
 args = getResolvedOptions(sys.argv, ['JOB_NAME'])
 print("start")
-table_name = 't_ctr_contract'
+table_name = 'qwe'
 schema_name = 'dev'
 rows_cnt = 0
 sqlserver_jdbc_url = ""
 redshift_jdbc_url = ""
-jks_file = ""
 pem_file = ""
 script_name = args["JOB_NAME"]
+result_str = ""
+result_int = -1
 
 sc = SparkContext()
 glueContext = GlueContext(sc)
@@ -31,18 +32,7 @@ glue_client = boto3.client('glue')
 getjob=glue_client.get_job(JobName=args["JOB_NAME"])
 jar_file = os.path.basename(getjob['Job']['DefaultArguments']['--extra-jars'])
 
-e_files = getjob['Job']['DefaultArguments']['--extra-files']
-if e_files != "":
-    e_files_list = e_files.split(",")
-    for e_file in e_files_list:
-        file_name = os.path.basename(e_file)
-        for dir_name in sys.path:
-            candidate = os.path.join(dir_name, file_name)
-            if os.path.isfile(candidate):
-                if candidate.endswith('.jks'):
-                    jks_file = candidate
-                    break
-					
+#sys.exit(0)
 conn_list = getjob['Job']['Connections']['Connections']
 if len(conn_list) < 2:
     raise Exception("Must have at least two connections")
@@ -145,6 +135,49 @@ rs = stmt.executeQuery(sql_txt)
 while (rs.next()):
     sql_txt=rs.getString(1)
 logger.info(sql_txt)
+
+# This table has primary key, unique or no indexes
+sql_txt = """
+SET NOCOUNT ON;
+SET QUOTED_IDENTIFIER ON;
+DECLARE @TBL_NAME VARCHAR(128) = '{0}';
+WITH CTE1 (clmn) AS 
+(SELECT clmn = 'PK' WHERE EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS c 
+JOIN sys.indexes i ON i.object_id = OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U') AND i.is_primary_key = 1
+WHERE c.TABLE_NAME = @TBL_NAME AND c.TABLE_SCHEMA = 'dbo')),
+CTE2 (clmn) AS
+(SELECT clmn = 'U' WHERE EXISTS (SELECT 1 FROM INFORMATION_SCHEMA.COLUMNS c 
+JOIN sys.indexes i ON i.object_id = OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U') AND i.is_unique = 1
+WHERE c.TABLE_NAME = @TBL_NAME AND c.TABLE_SCHEMA = 'dbo' AND NOT EXISTS (SELECT 1 FROM CTE1)))
+SELECT CASE WHEN EXISTS (SELECT 1 FROM CTE2) THEN (SELECT CTE2.clmn FROM CTE2)
+WHEN EXISTS (SELECT 1 FROM CTE1) THEN (SELECT CTE1.clmn FROM CTE1)
+ELSE 'NO INDEX' END AS clmn;
+""".format(table_name)
+logger.info(sql_txt)
+rs = stmt.executeQuery(sql_txt)
+while (rs.next()):
+    result_str=rs.getString(1)
+
+logger.info(result_str)
+# if this table has primary key, do pk cover all table?
+if result_str=='PK':
+    sql_txt ="""
+    SET NOCOUNT ON;
+    SET QUOTED_IDENTIFIER ON;
+    DECLARE @TBL_NAME VARCHAR(128) = '{0}';
+    SELECT (SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS c WHERE c.TABLE_NAME = @TBL_NAME AND c.TABLE_SCHEMA = 'dbo')-
+    (SELECT COUNT(*) FROM INFORMATION_SCHEMA.COLUMNS c 
+    JOIN sys.indexes i ON i.object_id = OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U') AND i.is_primary_key = 1 
+    JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id 
+    AND COLUMNPROPERTY(OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U'), c.COLUMN_NAME, 'ColumnId') = ic.column_id
+    WHERE c.TABLE_NAME = @TBL_NAME AND c.TABLE_SCHEMA = 'dbo') AS clmn;
+    """.format(table_name)
+    rs = stmt.executeQuery(sql_txt)
+    while (rs.next()):
+        result_int=rs.getInt(1)
+        if result_int == 0:
+            result_str = 'COVER PK'
+    
 	
 # drop temp table if exist
 sql_txt = "IF OBJECT_ID('tempdb..##{0}') IS NOT NULL DROP TABLE ##{0}l;".format(table_name)
@@ -163,16 +196,30 @@ SELECT 'CREATE TABLE ##' + @TBL_NAME + ' (' +
 STUFF((SELECT ',' + c.COLUMN_NAME + ' ' + c.DATA_TYPE +
 CASE WHEN c.DATA_TYPE = 'decimal' THEN ' (' + CAST(c.NUMERIC_PRECISION AS VARCHAR) + ',' + CAST(c.NUMERIC_SCALE AS VARCHAR) + ') ' 
 WHEN c.DATA_TYPE IN ('char','varchar','nvarchar') THEN ' (' + CAST(c.CHARACTER_MAXIMUM_LENGTH AS VARCHAR) + ') '
-ELSE '' END
+ELSE '' END + 
+CASE WHEN c.IS_NULLABLE = 'NO' THEN ' NOT NULL' ELSE '' END
 FROM INFORMATION_SCHEMA.COLUMNS c 
-LEFT OUTER JOIN sys.indexes i ON i.object_id = OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U') AND i.is_primary_key = 1
+LEFT OUTER JOIN sys.indexes i ON i.object_id = OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U') 
+""".format(table_name)
+
+if result_str == 'PK' or result_str == 'COVER PK':
+    sql_txt = sql_txt + ' AND i.is_primary_key = 1 '
+elif result_str == 'U':
+    sql_txt = sql_txt + ' AND i.is_unique = 1 '
+        
+sql_txt = sql_txt + """
 LEFT OUTER JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id 
 AND COLUMNPROPERTY(OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U'), c.COLUMN_NAME, 'ColumnId') = ic.column_id
 WHERE c.TABLE_NAME = @TBL_NAME AND c.TABLE_SCHEMA = 'dbo' AND ic.index_column_id IS NOT NULL
 ORDER BY c.ORDINAL_POSITION
 FOR XML PATH (''), TYPE).value('.', 'VARCHAR(4000)'),1,1,'')
-+ ' NOT NULL, chcksum int NOT NULL);'
-""".format(table_name)
+"""
+
+if result_str == 'PK' or result_str == 'U':
+    sql_txt = sql_txt + " + ' , chcksum int NOT NULL);'"
+else:
+    sql_txt = sql_txt + " + ');'"
+
 logger.info(sql_txt)
 rs = stmt.executeQuery(sql_txt)
 while (rs.next()):
@@ -183,21 +230,33 @@ stmt.executeUpdate(sql_txt)
 sql_txt = "INSERT INTO ods.etl_audit (etl_bch_id,cpo_nm,sta,msg) VALUES({0},'{1}','{2}','{3}')".format(batch_id,script_name,'SUCCESS',('CREATE ##' + table_name))
 aws_stmt.executeUpdate(sql_txt)
 
-# get select statement from Redshift
+# get select statement for Redshift
 sql_txt = """
 SET NOCOUNT ON;
 SET QUOTED_IDENTIFIER ON;
-DECLARE @TBL_NAME VARCHAR(128) = '{1}';
+DECLARE @TBL_NAME VARCHAR(128) = '{0}';
 SELECT 'SELECT ' + 
 STUFF((SELECT ',' + c.COLUMN_NAME 
 FROM INFORMATION_SCHEMA.COLUMNS c 
-LEFT OUTER JOIN sys.indexes i ON i.object_id = OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U') AND i.is_primary_key = 1
+LEFT OUTER JOIN sys.indexes i ON i.object_id = OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U') 
+""".format(table_name)
+if result_str == 'PK' or result_str == 'COVER PK':
+    sql_txt = sql_txt + ' AND i.is_primary_key = 1 '
+if result_str == 'U':
+    sql_txt = sql_txt + ' AND i.is_unique = 1 '
+sql_txt = sql_txt + """
 LEFT OUTER JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id 
 AND COLUMNPROPERTY(OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U'), c.COLUMN_NAME, 'ColumnId') = ic.column_id
 WHERE c.TABLE_NAME = @TBL_NAME AND c.TABLE_SCHEMA = 'dbo' AND ic.index_column_id IS NOT NULL
 ORDER BY c.ORDINAL_POSITION
-FOR XML PATH (''), TYPE).value('.', 'VARCHAR(4000)'),1,1,'') + ',chcksum FROM {0}.{1};'
-""".format(schema_name,table_name)
+FOR XML PATH (''), TYPE).value('.', 'VARCHAR(4000)'),1,1,'') 
+"""
+if result_str == 'PK' or result_str == 'U':
+    sql_txt = sql_txt + " + ',chcksum FROM {0}.{1};'".format(schema_name,table_name)
+elif result_str == 'COVER PK':
+    sql_txt = sql_txt + " + ' FROM {0}.{1};'".format(schema_name,table_name)
+    
+#sql_txt = "SELECT ctr_id, chcksum FROM {0}.{1};".format(schema_name,table_name)
 logger.info(sql_txt)
 rs = stmt.executeQuery(sql_txt)
 while (rs.next()):
@@ -217,7 +276,7 @@ bulkCopy.setDestinationTableName('##' + table_name)
 
 bulkCopy.writeToServer(rsSourceData);
 sql_txt = "INSERT INTO ods.etl_audit (etl_bch_id,cpo_nm,sta,msg) VALUES({0},'{1}','{2}','{3}')".format(batch_id,script_name,'SUCCESS',('LOAD ' + str(rows_cnt) + ' rows into temp table'))
-aws_stmt.executeUpdate(sql_txt) 
+aws_stmt.executeUpdate(sql_txt)
 
 sql_txt = """
 SET NOCOUNT ON;
@@ -234,31 +293,70 @@ FROM INFORMATION_SCHEMA.COLUMNS c
 WHERE c.TABLE_NAME = @TBL_NAME AND c.TABLE_SCHEMA = 'dbo' 
 ORDER BY c.ORDINAL_POSITION
 FOR XML PATH (''), TYPE).value('.', 'VARCHAR(MAX)'),1,1,'') 
-+ ',t.chcksum FROM (SELECT ' +  
+""".format(table_name)
+
+if result_str == 'PK' or result_str == 'U':
+    sql_txt = sql_txt + "+ ',t.chcksum "
+else:
+    sql_txt = sql_txt + " + ' "
+    
+sql_txt = sql_txt + """
+FROM (SELECT ' + 
 STUFF((SELECT ',' + c.COLUMN_NAME
 FROM INFORMATION_SCHEMA.COLUMNS c 
 WHERE c.TABLE_NAME = @TBL_NAME AND c.TABLE_SCHEMA = 'dbo' 
 ORDER BY c.ORDINAL_POSITION
-FOR XML PATH (''), TYPE).value('.', 'VARCHAR(MAX)'),1,1,'') + 
+FOR XML PATH (''), TYPE).value('.', 'VARCHAR(MAX)'),1,1,'')
+"""
+
+if result_str == 'PK' or result_str == 'U':
+    sql_txt = sql_txt + """
 + ', BINARY_CHECKSUM (' +
 STUFF((SELECT ',' + c.COLUMN_NAME
 FROM INFORMATION_SCHEMA.COLUMNS c 
-LEFT OUTER JOIN sys.indexes i ON i.object_id = OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U') AND i.is_primary_key = 1
+LEFT OUTER JOIN sys.indexes i ON i.object_id = OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U') 
+"""
+elif result_str == 'COVER PK':
+    sql_txt = sql_txt + ''
+    
+if result_str == 'PK':
+    sql_txt = sql_txt + ' AND i.is_primary_key = 1 '
+elif result_str == 'U':
+    sql_txt = sql_txt + ' AND i.is_unique = 1 '
+
+if result_str == 'PK' or result_str == 'U':
+    sql_txt = sql_txt + """
 LEFT OUTER JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id 
 AND COLUMNPROPERTY(OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U'), c.COLUMN_NAME, 'ColumnId') = ic.column_id
 WHERE c.TABLE_NAME = @TBL_NAME AND c.TABLE_SCHEMA = 'dbo' AND ic.index_column_id IS NULL
 ORDER BY c.ORDINAL_POSITION
 FOR XML PATH (''), TYPE).value('.', 'VARCHAR(MAX)'),1,1,'')
-+ ') AS chcksum FROM dbo.' + @TBL_NAME + ' ) AS t LEFT OUTER JOIN ##' + @TBL_NAME + ' AS tmp ON ' + 
++ ') AS chcksum 
+"""
+elif result_str == 'COVER PK':
+    sql_txt = sql_txt + " + ' "
+sql_txt = sql_txt + """
+ FROM dbo.' + @TBL_NAME + ' ) AS t LEFT OUTER JOIN ##' + @TBL_NAME + ' AS tmp ON ' + 
 STUFF((SELECT ' AND t.' + c.COLUMN_NAME + ' = tmp.' + c.COLUMN_NAME
 FROM INFORMATION_SCHEMA.COLUMNS c 
-LEFT OUTER JOIN sys.indexes i ON i.object_id = OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U') AND i.is_primary_key = 1
+LEFT OUTER JOIN sys.indexes i ON i.object_id = OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U') 
+"""
+if result_str == 'PK' :
+    sql_txt = sql_txt + ' AND i.is_primary_key = 1 '
+elif result_str == 'U':
+    sql_txt = sql_txt + ' AND i.is_unique = 1 '
+sql_txt = sql_txt + """   
 LEFT OUTER JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id 
 AND COLUMNPROPERTY(OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U'), c.COLUMN_NAME, 'ColumnId') = ic.column_id
 WHERE c.TABLE_NAME = @TBL_NAME AND c.TABLE_SCHEMA = 'dbo' AND ic.index_column_id IS NOT NULL
 ORDER BY c.ORDINAL_POSITION
-FOR XML PATH (''), TYPE).value('.', 'VARCHAR(MAX)'),1,4,'') + ' AND t.chcksum = tmp.chcksum WHERE tmp.chcksum IS NULL'
-""".format(table_name)
+FOR XML PATH (''), TYPE).value('.', 'VARCHAR(MAX)'),1,4,'') 
+"""
+
+if result_str == 'COVER PK':
+    sql_txt = sql_txt + " + (SELECT ' WHERE tmp.' + c.COLUMN_NAME + ' IS NULL' FROM INFORMATION_SCHEMA.COLUMNS c WHERE c.TABLE_NAME = '{0}' AND c.ORDINAL_POSITION = 1)".format(table_name)
+else:
+    sql_txt = sql_txt + "' + AND t.chcksum = tmp.chcksum WHERE tmp.chcksum IS NULL'"
 logger.info(sql_txt)
 rs = stmt.executeQuery(sql_txt)
 while (rs.next()):
@@ -282,12 +380,12 @@ aws_stmt.executeUpdate(sql_txt)
 
 # Convert Spark DataFrame to DynamicFrame
 dynamic_frame = DynamicFrame.fromDF(df, glueContext, "dynamic_frame")
-logger.info('glueContext.write_dynamic_frame')
+logger.info(F'glueContext.write_dynamic_frame to {schema_name}.{table_name}_diff')
 glueContext.write_dynamic_frame.from_jdbc_conf(
     frame=dynamic_frame,
     catalog_connection="mocsdw",
     connection_options={
-        "dbtable": "dev.t_ctr_contract_diff",
+        "dbtable": F"{schema_name}.{table_name}_diff",
         "database": "mocsdw"
     },
     redshift_tmp_dir=args["TempDir"],
@@ -304,30 +402,44 @@ DECLARE @TBL_NAME VARCHAR(128) = '{0}';
 SELECT CAST('UPDATE ' AS VARCHAR(MAX)) + 'dev.' + @TBL_NAME + ' SET ' + STUFF((SELECT 
  ', ' + c.COLUMN_NAME + ' = diff.' + c.COLUMN_NAME  
 FROM INFORMATION_SCHEMA.COLUMNS c 
-LEFT OUTER JOIN sys.indexes i ON i.object_id = OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U') AND i.is_primary_key = 1
+LEFT OUTER JOIN sys.indexes i ON i.object_id = OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U') 
+""".format(table_name)
+
+if result_str == 'PK' or result_str == 'COVER PK':
+    sql_txt = sql_txt + ' AND i.is_primary_key = 1 '
+elif result_str == 'U':
+    sql_txt = sql_txt + ' AND i.is_unique = 1 '
+sql_txt = sql_txt + """    
 LEFT OUTER JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id 
 AND COLUMNPROPERTY(OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U'), c.COLUMN_NAME, 'ColumnId') = ic.column_id
 WHERE c.TABLE_NAME = @TBL_NAME AND c.TABLE_SCHEMA = 'dbo' AND ic.index_column_id IS NULL
 ORDER BY c.ORDINAL_POSITION
-FOR XML PATH (''), TYPE).value('.', 'VARCHAR(MAX)'),1,1,'') + ' FROM dev.' + @TBL_NAME + '_diff AS diff WHERE ' +
+FOR XML PATH (''), TYPE).value('.', 'VARCHAR(MAX)'),1,1,'') + ' ,chcksum = diff.chcksum, etl_bch_id = {0} FROM dev.' + @TBL_NAME + '_diff AS diff WHERE ' +
 STUFF((SELECT ' AND dev.' + @TBL_NAME + '.' + c.COLUMN_NAME + ' = diff.' + c.COLUMN_NAME
 FROM INFORMATION_SCHEMA.COLUMNS c 
-LEFT OUTER JOIN sys.indexes i ON i.object_id = OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U') AND i.is_primary_key = 1
+LEFT OUTER JOIN sys.indexes i ON i.object_id = OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U') 
+""".format(batch_id)
+if result_str == 'PK' or result_str == 'COVER PK':
+    sql_txt = sql_txt + ' AND i.is_primary_key = 1 '
+elif result_str == 'U':
+    sql_txt = sql_txt + ' AND i.is_unique = 1 '
+sql_txt = sql_txt + """  
 LEFT OUTER JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id 
 AND COLUMNPROPERTY(OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U'), c.COLUMN_NAME, 'ColumnId') = ic.column_id
 WHERE c.TABLE_NAME = @TBL_NAME AND c.TABLE_SCHEMA = 'dbo' AND ic.index_column_id IS NOT NULL
 ORDER BY c.ORDINAL_POSITION
 FOR XML PATH (''), TYPE).value('.', 'VARCHAR(MAX)'),1,4,'') + ' AND dev.' + @TBL_NAME + '.chcksum != diff.chcksum'
-""".format(table_name)
-logger.info(sql_txt)
-rs = stmt.executeQuery(sql_txt)
-while (rs.next()):
-    sql_txt=rs.getString(1)
-logger.info(sql_txt)
-rows_cnt = aws_stmt.executeUpdate(sql_txt)
-logger.info('updated {0} rows'.format(rows_cnt))
-sql_txt = "INSERT INTO ods.etl_audit (etl_bch_id,cpo_nm,sta,msg,row_cnt) VALUES({0},'{1}','{2}','{3}',{4})".format(batch_id,script_name,'SUCCESS',('update ' + table_name),rows_cnt)
-aws_stmt.executeUpdate(sql_txt)
+"""
+if result_str == 'PK' or result_str == 'U':
+    logger.info(sql_txt)
+    rs = stmt.executeQuery(sql_txt)
+    while (rs.next()):
+        sql_txt=rs.getString(1)
+    logger.info(sql_txt)
+    rows_cnt = aws_stmt.executeUpdate(sql_txt)
+    logger.info('updated {0} rows'.format(rows_cnt))
+    sql_txt = "INSERT INTO ods.etl_audit (etl_bch_id,cpo_nm,sta,msg,row_cnt) VALUES({0},'{1}','{2}','{3}',{4})".format(batch_id,script_name,'SUCCESS',('update ' + table_name),rows_cnt)
+    aws_stmt.executeUpdate(sql_txt)
 
 sql_txt = """
 SET NOCOUNT ON;
@@ -338,22 +450,30 @@ SELECT CAST('INSERT INTO ' AS VARCHAR(MAX)) + 'dev.' + @TBL_NAME + ' ( ' + STUFF
 FROM INFORMATION_SCHEMA.COLUMNS c 
 WHERE c.TABLE_NAME = @TBL_NAME AND c.TABLE_SCHEMA = 'dbo'
 ORDER BY c.ORDINAL_POSITION
-FOR XML PATH (''), TYPE).value('.', 'VARCHAR(MAX)'),1,1,'') + ',chcksum ) SELECT ' +
+FOR XML PATH (''), TYPE).value('.', 'VARCHAR(MAX)'),1,1,'') + ',chcksum, etl_bch_id ) SELECT ' +
 STUFF((SELECT 
  ', ' + c.COLUMN_NAME  
 FROM INFORMATION_SCHEMA.COLUMNS c 
 WHERE c.TABLE_NAME = @TBL_NAME AND c.TABLE_SCHEMA = 'dbo'
 ORDER BY c.ORDINAL_POSITION
-FOR XML PATH (''), TYPE).value('.', 'VARCHAR(MAX)'),1,1,'') + ',chcksum FROM dev.' + @TBL_NAME + '_diff AS tmp WHERE NOT EXISTS (SELECT 1 FROM dev.' + @TBL_NAME + ' AS t WHERE ' +
+FOR XML PATH (''), TYPE).value('.', 'VARCHAR(MAX)'),1,1,'') + ',chcksum, {1} FROM dev.' + @TBL_NAME + '_diff AS tmp WHERE NOT EXISTS (SELECT 1 FROM dev.' + @TBL_NAME + ' AS t WHERE ' +
 STUFF((SELECT ' AND t.' + c.COLUMN_NAME + ' = tmp.' + c.COLUMN_NAME
 FROM INFORMATION_SCHEMA.COLUMNS c 
-LEFT OUTER JOIN sys.indexes i ON i.object_id = OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U') AND i.is_primary_key = 1
+LEFT OUTER JOIN sys.indexes i ON i.object_id = OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U') 
+""".format(table_name, batch_id)
+
+if result_str == 'PK' or result_str == 'COVER PK':
+    sql_txt = sql_txt + ' AND i.is_primary_key = 1 '
+elif result_str == 'U':
+    sql_txt = sql_txt + ' AND i.is_unique = 1 '
+
+sql_txt = sql_txt + """    
 LEFT OUTER JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id 
 AND COLUMNPROPERTY(OBJECT_ID((c.TABLE_SCHEMA + '.' + c.TABLE_NAME), N'U'), c.COLUMN_NAME, 'ColumnId') = ic.column_id
 WHERE c.TABLE_NAME = @TBL_NAME AND c.TABLE_SCHEMA = 'dbo' AND ic.index_column_id IS NOT NULL
 ORDER BY c.ORDINAL_POSITION
 FOR XML PATH (''), TYPE).value('.', 'VARCHAR(MAX)'),1,4,'') + ')'
-""".format(table_name)
+"""
 
 logger.info(sql_txt)
 rs = stmt.executeQuery(sql_txt)
