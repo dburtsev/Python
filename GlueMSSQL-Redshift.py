@@ -9,7 +9,7 @@ from awsglue.dynamicframe import DynamicFrame
 
 args = getResolvedOptions(sys.argv, ['JOB_NAME'])
 print("start")
-table_name = 'qwe'
+table_name = 't_usr_login_securable' # 't_ctr_contract' # 't_ctr_contract_document'
 schema_name = 'dev'
 rows_cnt = 0
 sqlserver_jdbc_url = ""
@@ -18,6 +18,7 @@ pem_file = ""
 script_name = args["JOB_NAME"]
 result_str = ""
 result_int = -1
+redshift_conn_name = ""
 
 sc = SparkContext()
 glueContext = GlueContext(sc)
@@ -42,6 +43,8 @@ for conn_name in conn_list:
     url = df.get('fullUrl')
     if url.startswith('jdbc:redshift'):
         redshift_jdbc_url = url + ';user=' + df.get('user') + ';password=' + df.get('password') 
+        redshift_conn_name = conn_name
+        logger.info(F"redshift connection name {redshift_conn_name}")
     elif url.startswith('jdbc:sqlserver'):
         pem_file = df.get('customJDBCCert')
         sqlserver_jdbc_url = url + ';user=' + df.get('user') + ';password=' + df.get('password') + ';hostNameInCertificate=' + df.get('customJDBCCertString') + ';enforceSSL=' + df.get('enforceSSL') + F';customJDBCCert={pem_file};trustServerCertificate=false'
@@ -383,7 +386,7 @@ dynamic_frame = DynamicFrame.fromDF(df, glueContext, "dynamic_frame")
 logger.info(F'glueContext.write_dynamic_frame to {schema_name}.{table_name}_diff')
 glueContext.write_dynamic_frame.from_jdbc_conf(
     frame=dynamic_frame,
-    catalog_connection="mocsdw",
+    catalog_connection=redshift_conn_name,
     connection_options={
         "dbtable": F"{schema_name}.{table_name}_diff",
         "database": "mocsdw"
@@ -491,4 +494,3 @@ logger.info(sql_txt)
 aws_stmt.executeUpdate(sql_txt)
 print("end")
 job.commit()
-# 
