@@ -13,8 +13,6 @@
 #Database = 'mocsdw'
 #DbUser = 'xyz'
 #i = ExecuteNonQuery(sql_client,ClusterIdentifier,Database,DbUser,sql)
-
-import boto3
 import time
 
 # Executes a SQL statement against the connection and returns the number of rows affected.
@@ -68,40 +66,35 @@ def ExecuteReader(Boto3Client,ClusterIdentifier,Database,DbUser,Sql):
     else:
         # now get record from query
         Response3 = Boto3Client.get_statement_result(Id=Response1['Id'])
-        #TotalNumRows = int(Response3["TotalNumRows"])
         return tuple(Response3["Records"])
 
 # Runs one or more SQL statements, which can be data manipulation language (DML) or data definition language (DDL).
 def ExecuteBatch(Boto3Client,ClusterIdentifier,Database,DbUser,Sql):
     # Execute batch statements
-    response = Boto3Client.batch_execute_statement(
-        ClusterIdentifier=ClusterIdentifier,
-        Database=Database,
-        DbUser=DbUser,
-        Sqls=Sql)
-    # Retrieve execution ID
-    query_id = response["Id"]
-    #print(f"Query Execution ID: {query_id}")
-    while True:
-        status_response = Boto3Client.describe_statement(Id=query_id)
-        status = status_response["Status"]
-        if status in ["FINISHED", "FAILED", "ABORTED"]:
-            return status
-        time.sleep(2)  # Wait before rechecking
-
-# Not working. Bug in boto3 always return 0 rows.
-def ExecuteCopy(Boto3Client,ClusterIdentifier,Database,DbUser,Sql):
-    #boto3.set_stream_logger('')
-    rows = 0
     Response1 = Boto3Client.execute_statement(ClusterIdentifier=ClusterIdentifier,Database=Database,DbUser=DbUser,Sql=Sql)
-    time.sleep(3)
     Response2 = Boto3Client.describe_statement(Id=Response1['Id'])
     while Response2['Status'] in ['PICKED', 'STARTED', 'SUBMITTED']:
+        time.sleep(2)  # Wait before rechecking
+
         Response2 = Boto3Client.describe_statement(Id=Response1['Id'])
     if Response2['Status'] != 'FINISHED':
         print("Expect FINISHED got " + Response2['Status'])
         raise ValueError("Expect FINISHED got " + Response2['Status'] + ' ' + Response2['Error'])
-    rows = int(Response2["ResultRows"])
-    return rows
 
+# Runs one or more SQL statements, which can be data manipulation language (DML) or data definition language (DDL).
+# as one transaction
+def ExecuteBatchTran(Boto3Client,ClusterIdentifier,Database,DbUser,Sql):
+    # Execute batch statements
+    Response1 = Boto3Client.batch_execute_statement(
+        ClusterIdentifier=ClusterIdentifier,
+        Database=Database,
+        DbUser=DbUser,
+        Sqls=Sql)
+    Response2 = Boto3Client.describe_statement(Id=Response1['Id'])
+    while Response2['Status'] in ['PICKED', 'STARTED', 'SUBMITTED']:
+        time.sleep(2)  # Wait before rechecking
 
+        Response2 = Boto3Client.describe_statement(Id=Response1['Id'])
+    if Response2['Status'] != 'FINISHED':
+        print("Expect FINISHED got " + Response2['Status'])
+        raise ValueError("Expect FINISHED got " + Response2['Status'] + ' ' + Response2['Error'])
