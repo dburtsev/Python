@@ -12,7 +12,14 @@
 #ClusterIdentifier = 'redmocs'
 #Database = 'mocsdw'
 #DbUser = 'xyz'
-#i = ExecuteNonQuery(sql_client,ClusterIdentifier,Database,DbUser,sql)
+#i = ExecuteNonQuery(sql_client,ClusterIdentifier,Database,DbUser,SQL)
+# sql = "SELECT CAST('t' AS BOOLEAN) AS clmn1, CAST(2.2 AS FLOAT4) AS clmn2, CAST(2.3 AS FLOAT) AS clmn3 UNION ALL SELECT CAST('f' AS BOOLEAN), 3.0::FLOAT4, 4.5::FLOAT;"
+# tbl = ExecuteReader(sql_client,ClusterIdentifier,Database,DbUser,sql)
+#for row in tbl:
+    #column_1 = list(row[0].values())[0]
+    #column_2 = list(row[1].values())[0]
+    #column_3 = list(row[2].values())[0]
+    #print(F"{column_1} | {column_2} | {column_3}")
 import time
 
 # Executes a SQL statement against the connection and returns the number of rows affected.
